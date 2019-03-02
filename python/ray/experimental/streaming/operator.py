@@ -6,8 +6,7 @@ import enum
 import logging
 
 logger = logging.getLogger(__name__)
-logger.setLevel("DEBUG")
-
+logging.basicConfig(level=logging.INFO)
 
 # Stream partitioning schemes
 class PScheme(object):
@@ -45,6 +44,8 @@ class OpType(enum.Enum):
     ReadTextFile = 9
     Reduce = 10
     Sum = 11
+    Union = 12
+    WriteTextFile = 13
     # ...
 
 
@@ -56,8 +57,7 @@ class Operator(object):
                  name="",
                  logic=None,
                  num_instances=1,
-                 other=None,
-                 state_actor=None):
+                 other=None):
         self.id = id
         self.type = type
         self.name = name
@@ -66,7 +66,6 @@ class Operator(object):
         # One partitioning strategy per downstream operator (default: forward)
         self.partitioning_strategies = {}
         self.other_args = other  # Depends on the type of the operator
-        self.state_actor = state_actor  # Actor to query state
 
     # Sets the partitioning scheme for an output stream of the operator
     def _set_partition_strategy(self,
@@ -99,7 +98,7 @@ class Operator(object):
         log = "Operator<\nID = {}\nName = {}\nType = {}\n"
         log += "Logic = {}\nNumber_of_Instances = {}\n"
         log += "Partitioning_Scheme = {}\nOther_Args = {}>\n"
-        logger.debug(
+        logger.info(
             log.format(self.id, self.name, self.type, self.logic,
                        self.num_instances, self.partitioning_strategies,
                        self.other_args))

@@ -15,6 +15,8 @@ logging.basicConfig(level=logging.INFO)
 # Forward and broadcast stream partitioning strategies
 forward_broadcast_strategies = [PStrategy.Forward, PStrategy.Broadcast]
 
+# Round robin and rescale partitioning strategies (default)
+round_robin_strategies = [PStrategy.RoundRobin, PStrategy.Rescale]
 
 # Used to choose output channel in case of hash-based shuffling
 def _hash(value):
@@ -143,13 +145,12 @@ class DataOutput(object):
 
     def __init__(self, channels, partitioning_schemes):
         self.key_selector = None
-        self.round_robin_indexes = [0]
         self.partitioning_schemes = partitioning_schemes
         # Prepare output -- collect channels by type
         self.forward_channels = []  # Forward and broadcast channels
         slots = sum(1 for scheme in self.partitioning_schemes.values()
-                    if scheme.strategy == PStrategy.RoundRobin)
-        self.round_robin_channels = [[]] * slots  # RoundRobin channels
+                    if scheme.strategy in round_robin_strategies)
+        self.round_robin_channels = [[]] * slots    # RoundRobin channels
         self.round_robin_indexes = [-1] * slots
         slots = sum(1 for scheme in self.partitioning_schemes.values()
                     if scheme.strategy == PStrategy.Shuffle)
@@ -187,7 +188,7 @@ class DataOutput(object):
                 self.shuffle_key_channels[pos].append(channel)
                 if pos == index_2:
                     index_2 += 1
-            elif strategy == PStrategy.RoundRobin:
+            elif strategy in round_robin_strategies :
                 pos = round_robin_destinations.setdefault(
                     channel.dst_operator_id, index_3)
                 self.round_robin_channels[pos].append(channel)
@@ -195,6 +196,17 @@ class DataOutput(object):
                     index_3 += 1
             else:  # TODO (john): Add support for other strategies
                 sys.exit("Unrecognized or unsupported partitioning strategy.")
+        # Change round robin to simple forward if there is only one channel
+        slots_to_remove = []
+        slot = 0
+        for channels in self.round_robin_channels:
+            if len(channels) == 1:
+                self.forward_channels.extend(channels)
+                slots_to_remove.append(slot)
+            slot += 1
+        for slot in slots_to_remove:
+            self.round_robin_channels.pop(slot)
+            self.round_robin_indexes.pop(slot)
         # A KeyedDataStream can only be shuffled by key
         assert not (self.shuffle_exists and self.shuffle_key_exists)
 
@@ -268,10 +280,10 @@ class DataOutput(object):
         for channels in self.round_robin_channels:
             self.round_robin_indexes[index] += 1
             if self.round_robin_indexes[index] == len(channels):
-                self.round_robin_indexes[index] = 0  # Reset index
+                self.round_robin_indexes[index] = 0     # Reset index
             channel = channels[self.round_robin_indexes[index]]
             logger.debug("[writer] Push record '{}' to channel {}".format(
-                record, channel))
+                                                            record, channel))
             channel.queue.put_next(record)
             index += 1
         # Hash-based shuffling by key
