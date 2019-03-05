@@ -5,7 +5,6 @@ from __future__ import print_function
 from ray.experimental.streaming.streaming import Environment
 from ray.experimental.streaming.operator import OpType, PStrategy
 
-
 def test_parallelism():
     """Tests operator parallelism."""
     env = Environment()
@@ -21,7 +20,7 @@ def test_parallelism():
             assert operator.num_instances == 2, (operator.num_instances, 2)
     # Check again after adding an operator with different parallelism
     stream.map(None, "Map1").shuffle().set_parallelism(3).map(
-        None, "Map2").set_parallelism(4)
+                                None, "Map2").set_parallelism(4)
     env._collect_garbage()
     for operator in env.operators.values():
         if operator.type == OpType.Source:
@@ -33,13 +32,12 @@ def test_parallelism():
         else:
             assert operator.num_instances == 4, (operator.num_instances, 4)
 
-
 def test_partitioning():
     """Tests stream partitioning."""
     env = Environment()
     # Try defining multiple partitioning strategies for the same stream
     _ = env.source(None).shuffle().rescale().broadcast().map(
-        None).broadcast().shuffle()
+                                        None).broadcast().shuffle()
     env._collect_garbage()
     for operator in env.operators.values():
         p_schemes = operator.partitioning_strategies
@@ -51,7 +49,6 @@ def test_partitioning():
             else:
                 assert scheme.strategy == PStrategy.Shuffle, (
                     scheme.strategy, PStrategy.Shuffle)
-
 
 def test_forking():
     """Tests stream forking."""
@@ -103,25 +100,24 @@ def test_forking():
                 assert destination == keyby1_id, (destination, keyby1_id)
             else:  # This must be the second branch
                 assert key_index == 1, (key_index, 1)
-                assert strategy == PStrategy.Forward, (strategy,
-                                                       PStrategy.Forward)
+                assert strategy == PStrategy.Rescale, (strategy,
+                                                       PStrategy.Rescale)
                 assert destination == keyby2_id, (destination, keyby2_id)
         elif source == keyby1_id or source == keyby2_id:
             p_scheme = operator.partitioning_strategies[destination]
             strategy = p_scheme.strategy
             key_index = env.operators[destination].other_args
             if key_index == 1:  # This must be the first branch
-                assert strategy == PStrategy.ShuffleByKey, (
-                    strategy, PStrategy.ShuffleByKey)
+                assert strategy == PStrategy.ShuffleByKey, (strategy,
+                                                       PStrategy.ShuffleByKey)
                 assert destination == sum1_id, (destination, sum1_id)
             else:  # This must be the second branch
                 assert key_index == 2, (key_index, 2)
-                assert strategy == PStrategy.ShuffleByKey, (
-                    strategy, PStrategy.ShuffleByKey)
+                assert strategy == PStrategy.ShuffleByKey, (strategy,
+                                                       PStrategy.ShuffleByKey)
                 assert destination == sum2_id, (destination, sum2_id)
         else:  # This must be a sum operator
             assert operator.type == OpType.Sum, (operator.type, OpType.Sum)
-
 
 def _test_shuffle_channels():
     """Tests shuffling connectivity."""
@@ -129,38 +125,47 @@ def _test_shuffle_channels():
     # Try defining a shuffle
     _ = env.source(None).shuffle().map(None).set_parallelism(4)
     expected = [(0, 0), (0, 1), (0, 2), (0, 3)]
-    _test_channels(env, expected)
+    _test_channels(env,expected)
 
+def _test_rescale_channels():
+    """Tests rescale connectivity."""
+    # Try the default partitioning strategy to scale down
+    env = Environment()
+    _ = env.source(None).set_parallelism(4).map(None).set_parallelism(2)
+    expected = [(0, 0), (1, 1), (2, 0), (3,1)]
+    _test_channels(env,expected)
+    # Try the default partitioning strategy to scale up
+    env = Environment()
+    _ = env.source(None).set_parallelism(2).map(None).set_parallelism(4)
+    expected = [(0, 0), (0, 1), (1, 2), (1,3)]
+    _test_channels(env,expected)
 
 def _test_forward_channels():
     """Tests forward connectivity."""
     env = Environment()
     # Try the default partitioning strategy
-    _ = env.source(None).set_parallelism(4).map(None).set_parallelism(2)
-    expected = [(0, 0), (1, 1), (2, 0), (3, 1)]
-    _test_channels(env, expected)
-
+    _ = env.source(None).set_parallelism(4).map(None).set_parallelism(4)
+    expected = [(0, 0), (1, 1), (2, 2), (3,3)]
+    _test_channels(env,expected)
 
 def _test_broadcast_channels():
     """Tests broadcast connectivity."""
     env = Environment()
     # Try broadcasting
-    _ = env.source(None).set_parallelism(4).broadcast().map(
-        None).set_parallelism(2)
-    expected = [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0), (3, 1)]
-    _test_channels(env, expected)
-
+    _ = env.source(None).set_parallelism(4
+             ).broadcast().map(None).set_parallelism(2)
+    expected = [(0, 0), (0, 1), (1, 0), (1,1), (2,0), (2,1), (3,0), (3,1)]
+    _test_channels(env,expected)
 
 def _test_round_robin_channels():
     """Tests round-robin connectivity."""
     env = Environment()
     # Try broadcasting
     _ = env.source(None).round_robin().map(None).set_parallelism(2)
-    expected = [(0, 0), (0, 1)]
-    _test_channels(env, expected)
+    expected = [(0,0),(0,1)]
+    _test_channels(env,expected)
 
-
-def _test_channels(environment, expected_channels):
+def _test_channels(environment,expected_channels):
     """Tests operator connectivity."""
     environment._collect_garbage()
     map_id = None
@@ -172,7 +177,7 @@ def _test_channels(environment, expected_channels):
     channels_per_destination = []
     for operator in environment.operators.values():
         channels_per_destination.append(
-            environment._generate_channels(operator))
+                            environment._generate_channels(operator))
     # Check actual connectivity
     actual = []
     for destination in channels_per_destination:
@@ -182,13 +187,12 @@ def _test_channels(environment, expected_channels):
                 dst_instance_id = channel.dst_instance_id
                 connection = (src_instance_id, dst_instance_id)
                 assert channel.dst_operator_id == map_id, (
-                    channel.dst_operator_id, map_id)
+                                    channel.dst_operator_id, map_id)
                 actual.append(connection)
     # Make sure connections are as expected
     set_1 = set(expected_channels)
     set_2 = set(actual)
     assert set_1 == set_2, (set_1, set_2)
-
 
 def test_channel_generation():
     """Tests data channel generation."""
@@ -196,7 +200,7 @@ def test_channel_generation():
     _test_broadcast_channels()
     _test_round_robin_channels()
     _test_forward_channels()
-
+    _test_rescale_channels()
 
 # TODO (john): Add simple wordcount test
 def test_wordcount():

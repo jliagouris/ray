@@ -9,9 +9,11 @@ import uuid
 
 import networkx as nx
 
+import ray
 from ray.experimental.streaming.communication import DataChannel, DataInput
 from ray.experimental.streaming.communication import DataOutput, QueueConfig
-from ray.experimental.streaming.operator import Operator, OpType
+import ray.experimental.streaming.operator as operator
+from ray.experimental.streaming.operator import OpType
 from ray.experimental.streaming.operator import PScheme, PStrategy
 import ray.experimental.streaming.operator_instance as operator_instance
 
@@ -33,6 +35,10 @@ all_to_all_strategies = [
     PStrategy.Shuffle, PStrategy.ShuffleByKey,
     PStrategy.Broadcast, PStrategy.RoundRobin
 ]
+
+# Source types
+# TODO (john): Add more
+source_types = [OpType.Source, OpType.ReadTextFile]
 
 
 # Environment configuration
@@ -57,7 +63,7 @@ class Config(object):
     """
 
     def __init__(self, parallelism=1, scheduling_period_in_records=float(
-                "inf"), scheduling_timeout=1):
+                "inf"), scheduling_timeout=1, task_based=False):
         # Batched queue configuration
         self.queue_config = QueueConfig()
         # Dataflow parallelism
@@ -65,6 +71,8 @@ class Config(object):
         # Parameters for periodic rescheduling of dataflow operators
         self.scheduling_period_in_records = scheduling_period_in_records
         self.scheduling_timeout = scheduling_timeout    # Default: 1s
+        # Task-based evaluation instead of queue-based
+        self.task_based = task_based
         # ...
 
 # A handle to the physical dataflow that is being executed
@@ -79,11 +87,13 @@ class PhysicalDataflow(object):
         # A mapping from operator ids to the list
         # of actor handles executing the operators
         self.actor_handles = {}
+        # A mapping from operator ids to operator metadata
+        self.operator_metadata = {}
         # Handle of the actor monitoring the
         # progress of the dataflow execution
         self.monitoring_actor = None
 
-    # Adds the actor's handle to the dictionary
+    # Adds an actor handle to the dictionary
     def _register_handle(self, actor_id, handle):
         operator_id, instance_id = actor_id
         entry = self.actor_handles.setdefault(operator_id, [None]*1)
@@ -95,16 +105,24 @@ class PhysicalDataflow(object):
         # local ids of operator instances are in 0..number_of_instances
         entry[instance_id] = handle
 
+    # Adds operator metadata to the dictionary
+    def _register_metadata(self, operator_id, metadata):
+        self.operator_metadata.setdefault(operator_id, metadata)
+
     # Returns None if operator id does not exist
-    def get_actor_handles(self, operator_id):
+    def actor_handles(self, operator_id):
         self.actor_handles.get(operator_id)
 
     # Returns all handles to actors executing the dataflow
-    def get_all_actor_handles(self):
+    def actor_handles(self):
         all = []
         for handles in self.operator_handles.values():
             all.extend(handles)
         return all
+
+    # Returns all operator ids in the dataflow
+    def operator_ids(self):
+        return self.actor_handles.keys()
 
     # Returns a list of futures representing the union of in-memory
     # states of all actors executing the given operator
@@ -115,6 +133,16 @@ class PhysicalDataflow(object):
         for actor_handle in actor_handles:
             state.append(actor_handle.state.remote())
         return state
+
+    # Returns a list of futures representing the logged throughput
+    # values for all actors executing the given operator
+    def logs_of(self, operator_id):
+        logs = []  # One log object per operator instance
+        actor_handles = self.actor_handles.get(operator_id)
+        assert actor_handles is not None
+        for actor_handle in actor_handles:
+            logs.append(actor_handle.logs.remote())
+        return logs
 
     # Returns a future representing the execution's status upon termination
     def termination_status(self):
@@ -174,9 +202,6 @@ class Environment(object):
         # Select actor to construct
         actor_handle = None
         if operator.type == OpType.Source:
-            import IPython
-            IPython.embed()
-            
             actor_handle = operator_instance.Source.remote(actor_id, operator,
                                                         input, output)
         elif operator.type == OpType.Map:
@@ -190,6 +215,10 @@ class Environment(object):
             actor_handle = operator_instance.Filter.remote(actor_id, operator,
                                                     input, output)
         elif operator.type == OpType.Union:
+            # Other input streams are not needed any more.
+            # Discard them to avoid serialization errors due to
+            # recursive references between stream and environment
+            operator.other_inputs.clear()
             actor_handle = operator_instance.Union.remote(actor_id, operator,
                                                        input, output)
         elif operator.type == OpType.Reduce:
@@ -221,9 +250,19 @@ class Environment(object):
         else:  # TODO (john): Add support for other types of operators
             sys.exit("Unrecognized or unsupported {} operator type.".format(
                 operator.type))
-        actor_handle.register_handle.remote(actor_handle)
+        # Register current actor handle as destination to upstream actors
+        for channel in input.input_channels:
+            operator_id, _ = channel.src_actor_id
+            upstream_actor_handles = self.physical_dataflow.actor_handles[
+                                                                operator_id]
+            for handle in upstream_actor_handles:
+                # Make sure the handle is registered before proceeding
+                ray.get(handle._register_destination_handle.remote(
+                                            actor_handle, channel.id))
+        actor_handle._register_handle.remote(actor_handle)
         self.physical_dataflow._register_handle(actor_id,actor_handle)
-        _ = actor_handle.start.remote()
+        self.physical_dataflow._register_metadata(operator.id,operator)
+        assert actor_handle is not None
         return actor_handle
 
     # Constructs and deploys a Ray actor for each instance of
@@ -244,7 +283,7 @@ class Environment(object):
         logger.info("Generating {} actors of type {}...".format(
             num_instances, operator.type))
         in_channels = upstream_channels.pop(
-            operator.id) if upstream_channels else []
+            operator.id) if operator.id in upstream_channels else []
         handles = []
         for i in range(num_instances):
             # Collect input and output channels for the particular instance
@@ -287,6 +326,7 @@ class Environment(object):
         The number of total channels generated depends on the partitioning
         strategy specified by the user.
         """
+        env_config = self.config
         channels = {}  # destination operator id -> channels
         strategies = operator.partitioning_strategies
         for dst_operator, p_scheme in strategies.items():
@@ -295,8 +335,8 @@ class Environment(object):
             if p_scheme.strategy in all_to_all_strategies:
                 for i in range(operator.num_instances):
                     for j in range(num_dest_instances):
-                        channel = DataChannel(self, operator.id, dst_operator,
-                                              i, j)
+                        channel = DataChannel(env_config, operator.id,
+                                              dst_operator, i, j)
                         entry.append(channel)
             elif p_scheme.strategy == PStrategy.Rescale:
                 channels_per_instance = math.ceil(
@@ -306,8 +346,8 @@ class Environment(object):
                     for _ in range(channels_per_instance):
                         if index == num_dest_instances:
                             index = i % num_dest_instances
-                        channel = DataChannel(self, operator.id, dst_operator,
-                                              i, index)
+                        channel = DataChannel(env_config, operator.id,
+                                              dst_operator, i, index)
                         entry.append(channel)
                         index += 1
             else:
@@ -338,6 +378,10 @@ class Environment(object):
     def set_parallelism(self, parallelism):
         self.config.parallelism = parallelism
 
+    # Enables task-based execution
+    def enable_tasks(self):
+        self.config.task_based = True
+
     # Sets batched queue configuration for the environment
     def set_queue_config(self, queue_config):
         self.config.queue_config = queue_config
@@ -346,11 +390,13 @@ class Environment(object):
     # TODO (john): There should be different types of sources, e.g. sources
     # reading from Kafka, text files, etc.
     # TODO (john): Handle case where environment parallelism is set
-    def source(self, source):
+    def source(self, source_object):
         source_id = _generate_uuid()
         source_stream = DataStream(self, source_id)
-        self.operators[source_id] = Operator(source_id, OpType.Source,
-                                             "Source",other=source)
+        self.operators[source_id] = operator.CustomSourceOperator(source_id,
+                                             OpType.Source,
+                                             source_object,
+                                             "Source")
         return source_stream
 
     # Creates and registers a new data source that reads a
@@ -361,8 +407,8 @@ class Environment(object):
     def read_text_file(self, filepath):
         source_id = _generate_uuid()
         source_stream = DataStream(self, source_id)
-        self.operators[source_id] = Operator(
-            source_id, OpType.ReadTextFile, "Read Text File", other=filepath)
+        self.operators[source_id] = operator.ReadTextFileOperator(
+            source_id, OpType.ReadTextFile, filepath, "Read Text File")
         return source_stream
 
     # Constructs and deploys the physical dataflow
@@ -395,6 +441,15 @@ class Environment(object):
         # Start and register the monitoring actor to the physical dataflow
         monitoring_actor = operator_instance.ProgressMonitor.remote(all_handles)
         self.physical_dataflow.monitoring_actor = monitoring_actor
+        # Start spinning actors
+        for entry in self.physical_dataflow.actor_handles.items():
+            operator_id, actor_handles = entry
+            operator = self.physical_dataflow.operator_metadata[operator_id]
+            operator_type = operator.type
+            # In task-based execution only source actors are spinning
+            if (not self.config.task_based) or operator_type in source_types:
+                for actor_handle in actor_handles:
+                    _ = actor_handle.start.remote()  # Start spinning
         return self.physical_dataflow
 
     # Prints the logical dataflow graph
@@ -505,7 +560,7 @@ class DataStream(object):
         input_streams = [self]
         # TODO (john): Add support for other multiple-input operators
         if operator.type == OpType.Union:
-            input_streams.extend(operator.other_args)
+            input_streams.extend(operator.other_inputs)
         # ...
         for input_stream in input_streams:
             input_stream.dst_operator_id = operator.id
@@ -601,7 +656,7 @@ class DataStream(object):
         Attributes:
              map_fn (function): The user-defined logic of the map.
         """
-        op = Operator(
+        op = operator.Operator(
             _generate_uuid(),
             OpType.Map,
             name,
@@ -617,7 +672,7 @@ class DataStream(object):
              flatmap_fn (function): The user-defined logic of the flatmap
              (e.g. split()).
         """
-        op = Operator(
+        op = operator.Operator(
             _generate_uuid(),
             OpType.FlatMap,
             "FlatMap",
@@ -634,11 +689,11 @@ class DataStream(object):
              key_attribute_index (int): The index of the key attributed
              (assuming tuple records).
         """
-        op = Operator(
+        op = operator.KeyByOperator(
             _generate_uuid(),
             OpType.KeyBy,
+            key_selector,
             "KeyBy",
-            other=key_selector,
             num_instances=self.env.config.parallelism)
         return self.__register(op)
 
@@ -650,7 +705,7 @@ class DataStream(object):
              sum_attribute_index (int): The index of the attribute to sum
              (assuming tuple records).
         """
-        op = Operator(
+        op = operator.Operator(
             _generate_uuid(),
             OpType.Reduce,
             "Sum",
@@ -666,27 +721,27 @@ class DataStream(object):
              sum_attribute_index (int): The index of the attribute to sum
              (assuming tuple records).
         """
-        op = Operator(
+        op = operator.SumOperator(
             id,
             OpType.Sum,
+            attribute_selector,
             "Sum",
             _sum,
-            other=attribute_selector,
             num_instances=self.env.config.parallelism)
         return self.__register(op)
 
     # Registers union operator to the environment
-    def union(self, other_streams):
+    def union(self, other_inputs):
         """Unions the stream with one or more other streams.
 
         Attributes:
              other_streams list(DataStream): The list of streams to union.
         """
-        op = Operator(
+        op = operator.UnionOperator(
             _generate_uuid(),
             OpType.Union,
+            other_inputs,
             "Union",
-            other=other_streams,  # A list of one or more data streams
             num_instances=self.env.config.parallelism)
         return self.__register(op)
 
@@ -694,17 +749,17 @@ class DataStream(object):
     # This is a system time window
     # TODO (john): This must be applied on a KeyedDataStream and
     # must return a WindowedDataStream
-    def time_window(self, window_width_ms):
+    def time_window(self, window_length_ms):
         """Applies a system time window to the stream.
 
         Attributes:
              window_width_ms (int): The length of the window in ms.
         """
-        op = Operator(
+        op = operator.TimeWindowOperator(
             _generate_uuid(),
             OpType.TimeWindow,
+            window_length_ms,
             "TimeWindow",
-            other=window_width_ms,
             num_instances=self.env.config.parallelism)
         return self.__register(op)
 
@@ -715,7 +770,7 @@ class DataStream(object):
         Attributes:
              filter_fn (function): The user-defined filter function.
         """
-        op = Operator(
+        op = operator.Operator(
             _generate_uuid(),
             OpType.Filter,
             "Filter",
@@ -725,7 +780,7 @@ class DataStream(object):
 
     # TODO (john): Registers window join operator to the environment
     def window_join(self, other_stream, join_attribute, window_width):
-        op = Operator(
+        op = operator.Operator(
             _generate_uuid(),
             OpType.WindowJoin,
             "WindowJoin",
@@ -739,7 +794,7 @@ class DataStream(object):
         Attributes:
              inspect_logic (function): The user-defined inspect function.
         """
-        op = Operator(
+        op = operator.Operator(
             _generate_uuid(),
             OpType.Inspect,
             "Inspect",
@@ -753,11 +808,12 @@ class DataStream(object):
     # before flushing to disk
     def write_text_file(self, filename_prefix, logic=None):
         """Closes the stream with a sink operator."""
-        op = Operator(
+        op = operator.WriteTextFileOperator(
             _generate_uuid(),
             OpType.WriteTextFile,
+            filename_prefix,
             "Write Text File",
-            other = [filename_prefix,logic],
+            logic,
             num_instances=self.env.config.parallelism)
         return self.__register(op)
 
@@ -766,7 +822,7 @@ class DataStream(object):
     # export data to other systems
     def sink(self):
         """Closes the stream with a sink operator."""
-        op = Operator(
+        op = operator.Operator(
             _generate_uuid(),
             OpType.Sink,
             "Sink",

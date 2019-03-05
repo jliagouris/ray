@@ -86,7 +86,7 @@ if __name__ == "__main__":
     # A Ray streaming environment with the default configuration
     env = Environment()
     env.set_parallelism(2)  # Each operator will be executed by two actors
-
+    
     # The following dataflow is a simple streaming wordcount
     #  with a rolling sum operator.
     # It reads articles from wikipedia, splits them in words,

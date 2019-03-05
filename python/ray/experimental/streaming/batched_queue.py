@@ -86,16 +86,26 @@ class BatchedQueue(object):
     """
 
     def __init__(self,
+                 channel_id,
+                 src_operator_id, src_instance_id,
+                 dst_operator_id, dst_instance_id,
                  max_size=999999,
                  max_batch_size=99999,
                  max_batch_time=0.01,
                  prefetch_depth=10,
-                 background_flush=True):
+                 background_flush=True,
+                 task_based=False):
+        self.src_operator_id = src_operator_id
+        self.src_instance_id = src_instance_id
+        self.dst_operator_id = dst_operator_id
+        self.dst_instance_id = dst_instance_id
+        self.channel_id = channel_id
         self.max_size = max_size
         self.max_batch_size = max_batch_size
         self.max_batch_time = max_batch_time
         self.prefetch_depth = prefetch_depth
         self.background_flush = background_flush
+        self.task_based = task_based  # True for task-based data exchange
 
         # Common queue metadata -- This serves as the unique id of the queue
         self.base = np.random.randint(0, 2**32 - 1, size=5, dtype="uint32")
@@ -120,6 +130,9 @@ class BatchedQueue(object):
         self.flush_thread = FlushThread(self.max_batch_time,
                                         self._flush_writes)
 
+        self.source_actor = None
+        self.destination_actor = None
+
     def __getstate__(self):
         state = dict(self.__dict__)
         del state["flush_lock"]
@@ -129,16 +142,6 @@ class BatchedQueue(object):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-
-    # This is to enable writing functionality in
-    # case the queue is not created by the writer
-    # The reason is that python locks cannot be serialized
-    def enable_writes(self):
-        """Restores the state of the batched queue for writing."""
-        self.write_buffer = []
-        self.flush_lock = threading.RLock()
-        self.flush_thread = FlushThread(self.max_batch_time,
-                                        self._flush_writes)
 
     # Batch ids consist of a unique queue id used as prefix along with
     # two numbers generated using the batch offset in the queue
@@ -152,15 +155,21 @@ class BatchedQueue(object):
         with self.flush_lock:
             if not self.write_buffer:
                 return
-            batch_id = self._batch_id(self.write_batch_offset)
-            ray.worker.global_worker.put_object(
-                ray.ObjectID(batch_id), self.write_buffer)
+            if self.task_based is True:  # Submit a new task
+                self.destination_actor.apply.remote([self.write_buffer],
+                                                    self.channel_id)
+            else:  # Flush batch to plasma
+                batch_id = self._batch_id(self.write_batch_offset)
+                ray.worker.global_worker.put_object(
+                    ray.ObjectID(batch_id), self.write_buffer)
             logger.debug("[writer] Flush batch {} offset {} size {}".format(
                 self.write_batch_offset, self.write_item_offset,
                 len(self.write_buffer)))
             self.write_buffer = []
             self.write_batch_offset += 1
-            self._wait_for_reader()
+            # TODO (john): Simulate backpressure in task-based execution
+            if self.task_based is False:
+                self._wait_for_reader()
             self.last_flush_time = time.time()
 
     def _wait_for_reader(self):
@@ -171,7 +180,7 @@ class BatchedQueue(object):
             return  # Hasn't reached max size
         remote_offset = internal_kv._internal_kv_get(self.read_ack_key)
         if remote_offset is None:
-            # logger.debug("[writer] Waiting for reader to start...")
+            logger.debug("[writer] Waiting for reader to start...")
             while remote_offset is None:
                 time.sleep(0.01)
                 remote_offset = internal_kv._internal_kv_get(self.read_ack_key)
@@ -205,6 +214,28 @@ class BatchedQueue(object):
             internal_kv._internal_kv_put(
                 self.read_ack_key, offset, overwrite=True)
 
+    # This is to enable writing functionality in
+    # case the queue is not created by the writer
+    # The reason is that python locks cannot be serialized
+    def enable_writes(self):
+        """Restores the state of the batched queue for writing."""
+        self.write_buffer = []
+        self.flush_lock = threading.RLock()
+        self.flush_thread = FlushThread(self.max_batch_time,
+                                        self._flush_writes)
+
+    # Registers source actor handle
+    def register_source_actor(self, actor_handle):
+        logger.debug("Registered source {} at channel {}".format(
+                                            actor_handle, self.channel_id))
+        self.source_actor = actor_handle
+
+    # Registers destination actor handle
+    def register_destination_actor(self, actor_handle):
+        logger.debug("Registered destination {} at channel {}".format(
+                                            actor_handle, self.channel_id))
+        self.destination_actor = actor_handle
+
     def put_next(self, item):
         with self.flush_lock:
             if self.background_flush and not self.flush_thread.is_alive():
@@ -220,6 +251,8 @@ class BatchedQueue(object):
                 self._flush_writes()
 
     def read_next(self):
+        # Actors never pull in task-based execution 
+        assert self.task_based is False
         if not self.read_buffer:
             self._read_next_batch()
             assert self.read_buffer

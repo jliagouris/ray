@@ -27,7 +27,7 @@ parser.add_argument("--record-size", default=10,
 parser.add_argument("--latency-file", required=True,
                     help="the file to log per-record latencies")
 parser.add_argument("--throughput-file", required=True,
-                    help="the file to log actor throughputs")
+                    help="the file to log actors throughput")
 parser.add_argument("--sample-period", default=1,
                     help="every how many input records latency is measured.")
 parser.add_argument("--queue-size", default=10000,
@@ -56,8 +56,7 @@ class Node(object):
         num_writes (int): Number of elements written.
     """
     def __init__(self, id, in_queue, out_queue,
-                    max_reads_per_second=float("inf"),
-                    log_file=None):
+                    max_reads_per_second=float("inf"),log_latency=False):
         self.id = id
         self.queue = in_queue
         self.out_queue = out_queue
@@ -65,12 +64,9 @@ class Node(object):
         self.num_reads = 0
         self.num_writes = 0
         self.throughputs = []
+        self.latencies = []
         self.start = time.time()
-        self.log_file = log_file
-        # Open log file for writing
-        if self.log_file:
-            self.writer = open(self.log_file, "w")
-
+        self.log_latency = log_latency
 
     def read_write(self, rounds):
         debug_log = "[actor {}] Reads throttled to {} reads/s"
@@ -87,22 +83,17 @@ class Node(object):
             N = 100000
             for _ in range(N):
                 record = self.queue.read_next()
-                try:
-                    start_time, value = record
-                except TypeError:
-                    start_time = -1
-                    value = record
+                start_time, value = record
                 expected_value += 1
                 self.num_reads += 1
                 if self.out_queue is not None:
                     self.out_queue.put_next((start_time,value))
                     self.num_writes += 1
-                elif self.log_file:  # Log end-to-end latency
+                elif self.log_latency:  # Log end-to-end latency
                     # TODO (john): Clock skew might distort elapsed time
                     if start_time != -1:
                         elapsed_time = time.time() - start_time
-                        flog = str(elapsed_time) + " " + str(value) + "\n"
-                        self.writer.write(flog)
+                        self.latencies.append(elapsed_time)
                 while (self.num_reads / (time.time() - self.start) >
                         self.max_reads_per_second):
                     logger.debug(debug_log.format(self.id,
@@ -114,26 +105,31 @@ class Node(object):
         # Flush any remaining elements
         if self.out_queue is not None:
             self.out_queue._flush_writes()
-        elif self.log_file:  # Close log file
-            self.writer.close()
 
-        return (self.id, self.throughputs)
+        return (self.id, self.latencies, self.throughputs)
 
-def test_max_throughput(rounds, latency_file, throughput_file,
+def benchmark_queue(rounds, latency_file,
+                        throughput_file,
+                        record_type, record_size,
                         sample_period, max_queue_size,
                         max_batch_size, batch_timeout,
                         prefetch_depth, background_flush,
                         num_queues, max_reads_per_second=float("inf")):
     assert num_queues >= 1
     first_queue = BatchedQueue(
+        "ID",           # Dummy channel id
+        "SRC_OP_ID",    # Dummy source operator id
+        0,              # Dummy source instance id
+        "DST_OP_ID",    # Dummy destination operator id
+        0,              # Dummy destination instance id
         max_size=max_queue_size,
         max_batch_size=max_batch_size,
         max_batch_time=batch_timeout,
         prefetch_depth=prefetch_depth,
         background_flush=background_flush)
     previous_queue = first_queue
-    throughputs = []
-    log_file = None
+    logs = []
+    log_latency = False
     for i in range(num_queues):
         # Construct the batched queue
         in_queue = previous_queue
@@ -145,16 +141,18 @@ def test_max_throughput(rounds, latency_file, throughput_file,
                 max_batch_time=batch_timeout,
                 prefetch_depth=prefetch_depth,
                 background_flush=background_flush)
-        else:  # Pass the log filename to the last actor
-            log_file = latency_file
+        else:  # The last actor should log per-record latencies
+            log_latency = True
         node = Node.remote(i, in_queue, out_queue,
-                           max_reads_per_second, log_file)
-        # output will eventually store a None value returned by
-        # calling read_write() on the last actor
-        throughputs.append(node.read_write.remote(rounds))
+                           max_reads_per_second,log_latency)
+        # Each actor returns a list of per-record latencies
+        # sampled every 'sample_period' records
+        # and a list of throughput values estimated for every
+        # N = 100000 records in its input
+        logs.append(node.read_write.remote(rounds))
         previous_queue = out_queue
 
-    value = 0
+    value = 0 if record_type == "int" else ""
     count = 0
     source_throughputs = []
     # Feed the chain
@@ -174,23 +172,59 @@ def test_max_throughput(rounds, latency_file, throughput_file,
         logger.info(log.format(N / (time.time() - start)))
         source_throughputs.append(N / (time.time() - start))
     first_queue._flush_writes()
-    result = ray.get(throughputs)
-    result.append((-1,source_throughputs))  # Use -1 as the source id
-    # Write throughputs to file
+    result = ray.get(logs)
+    result.append((-1,[],source_throughputs))  # Use -1 as the source id
+    # Write log files
+    with open(latency_file, "w") as lf:
+        for node_id, latencies, _ in result:
+            for latency in latencies:
+                lf.write(str(node_id) + " " + str(latency) + "\n")
     with open(throughput_file, "w") as tf:
-        for node_id, throughputs in result:
+        for node_id, _, throughputs in result:
             for throughput in throughputs:
                 tf.write(str(node_id) + " " + str(throughput) + "\n")
 
-def get_next_int(self):
-    self.record += 1
-    return self.record
+class RecordGenerator(object):
+    def __init__(self, rounds, record_type="int",
+                 record_size=None, sample_period=1):
+        assert rounds > 0
+        self.total_elements = 100000 * rounds
+        self.total_count = 0
+        self.period = sample_period
+        self.count = 0
+        self.current_round = 0
+        self.record_type = record_type
+        self.record_size = record_size
+        self.record = -1
+        # Set the right function
+        if self.record_type == "int":
+            self.__get_next_record = self.__get_next_int
+        else:
+            self.__get_next_record = self.__get_next_string
 
-# Returns the next random string
-def get_next_string(self):
-    return ''.join(random.choice(
-            string.ascii_letters + string.digits) for _ in range(
-                                                            record_size))
+    # Returns the next int
+    def __get_next_int(self):
+        self.record += 1
+        return self.record
+
+    # Returns the next random string
+    def __get_next_string(self):
+        return "".join(random.choice(
+                string.ascii_letters + string.digits) for _ in range(
+                                                            self.record_size))
+
+    def get_next(self):
+        if self.total_count == self.total_elements:
+            return None
+        record = self.__get_next_record()
+        self.total_count += 1
+        self.count += 1
+        if self.count == self.period:
+            self.count = 0
+            return (time.time(),record)  # Assign the generation timestamp
+        else:
+            return(-1,record)
+
 if __name__ == "__main__":
     ray.init()
     ray.register_custom_serializer(BatchedQueue, use_pickle=True)
@@ -226,31 +260,23 @@ if __name__ == "__main__":
     logger.info("Background flush: {}".format(background_flush))
     logger.info("Max read throughput: {}".format(max_reads_per_second))
 
-    # Estimate the 'ideal' throughput
-    value = 0 if record_type == "int" else ""
-    total_count = 0
+    # A record generator
+    generator = RecordGenerator(rounds, record_type, record_size,
+                                sample_period)
     count = 0
     start = time.time()
-    for round in range(rounds):
-        N = 100000
-        for _ in range(N):
-            count += 1
-            if count == sample_period:
-                count = 0
-                time.time()
-            if record_type == "int":
-                value += 1
-            else:
-                value = "".join(random.choice(
-                        string.ascii_letters + string.digits) for _ in range(
-                                                                record_size))
-            total_count += 1
-    logger.info("Ideal throughput: {}".format(
-                                        total_count / (time.time()-start)))
+    while True:
+        next = generator.get_next()
+        if next is None:
+            break
+        count += 1
+    logger.info("Ideal throughput: {}".format(count / (time.time()-start)))
 
-    logger.info("== Testing max throughput ==")
+    logger.info("== Testing Batched Queue Chaining ==")
     start = time.time()
-    test_max_throughput(rounds, latency_filename, throughput_filename,
+    benchmark_queue(rounds, latency_filename,
+                        throughput_filename,
+                        record_type, record_size,
                         sample_period, max_queue_size,
                         max_batch_size, batch_timeout,
                         prefetch_depth, background_flush,

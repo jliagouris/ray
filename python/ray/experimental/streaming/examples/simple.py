@@ -12,7 +12,7 @@ from ray.experimental.streaming.batched_queue import BatchedQueue
 from ray.experimental.streaming.operator import OpType, PStrategy
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--input-file", required=True, help="the input text file")
@@ -37,6 +37,7 @@ if __name__ == "__main__":
 
     # A Ray streaming environment with the default configuration
     env = Environment()
+    env.enable_tasks()
 
     # Stream represents the ouput of the filter and
     # can be forked into other dataflows

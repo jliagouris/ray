@@ -21,20 +21,22 @@ logging.basicConfig(level=logging.INFO)
 parser = argparse.ArgumentParser()
 parser.add_argument("--rounds", default=10,
                     help="the number of experiment rounds")
-parser.add_argument("--record-type", default="int",
-                    choices = ["int","string"],
-                    help="the number of instances per operator")
 parser.add_argument("--fan-in", default=0,
                     help="the number of input channels to the 2nd stage")
 parser.add_argument("--fan-out", default=0,
                     help="the number of output channels from the 1st stage")
-parser.add_argument("--log-file", required=True,
+parser.add_argument("--latency-file", required=True,
                     help="the file to log per-record latencies")
+parser.add_argument("--throughput-file", required=True,
+                    help="the file to log actors throughput")
 parser.add_argument("--sample-period", default=1,
                     help="every how many input records latency is measured.")
+parser.add_argument("--record-type", default="int",
+                    choices = ["int","string"],
+                    help="the type of records used in the benchmark")
 parser.add_argument("--record-size", default=10,
                     help="the size of a record of type string in bytes")
-parser.add_argument("--partitioning", default = "broadcast",
+parser.add_argument("--partitioning", default = "round_robin",
                     choices = ["shuffle","round_robin","broadcast"],
                     help="whether to shuffle or balance after each stage")
 parser.add_argument("--queue-size", default=10000,
@@ -50,22 +52,6 @@ parser.add_argument("--background-flush", default=False,
 parser.add_argument("--max-throughput", default="inf",
                     help="maximum read throughput (elements/s)")
 
-def compute_elapsed_time(record):
-    try:
-        generation_time, data = record
-        # TODO (john): Clock skew might distort elapsed time
-        return str(time.time() - generation_time) + " " + str(data)
-    except TypeError:
-        return ""
-
-def reset_elapsed_time(record):
-    try:
-        generation_time, data = record
-        # TODO (john): Clock skew might distort elapsed time
-        return (time.time(), data)
-    except TypeError:
-        return record
-
 # A custom source that periodically assigns timestamps to records
 class Source(object):
     def __init__(self, rounds, record_type="int",
@@ -78,13 +64,7 @@ class Source(object):
         self.current_round = 0
         self.record_type = record_type
         self.record_size = record_size
-        assert self.record_type in ["int","string"], (self.record_type)
-        # Set the right function
-        if self.record_type == "int":
-            self.record = -1
-            self.__get_next_record = self.__get_next_int
-        else:
-            self.__get_next_record = self.__get_next_string
+        self.record = -1
 
     # Returns the next int
     def __get_next_int(self):
@@ -93,67 +73,98 @@ class Source(object):
 
     # Returns the next random string
     def __get_next_string(self):
-        return ''.join(random.choice(
+        return "".join(random.choice(
                 string.ascii_letters + string.digits) for _ in range(
-                                                                record_size))
+                                                        self.record_size))
 
     # Generates next record
     def get_next(self):
+        record = None
         if self.total_count == self.total_elements:
-            return None
-        record = self.__get_next_record()
+            print("Source Done")
+            return record
+        self.record += 1
+        record = self.record
         self.total_count += 1
         self.count += 1
+        print(self.record)
         if self.count == self.period:
             self.count = 0
             return (time.time(),record)  # Assign the generation timestamp
         else:
-            return self.record
+            return (-1,record)
+
+def compute_elapsed_time(record):
+    generation_time, _ = record
+    if generation_time != -1:
+        # TODO (john): Clock skew might distort elapsed time
+        return [time.time() - generation_time]
+    else:
+        return []
 
 # Measures latency
-def fan_in_dataflow(rounds, fan_in, partitioning, record_type,
-                    record_size, queue_config, log_filename,
-                    sample_period):
+def fan_in_benchmark(rounds, fan_in, partitioning, record_type,
+                    record_size, queue_config, sample_period,
+                    latency_filename, throughput_filename):
     # Create streaming environment, construct and run dataflow
     env = Environment()
     env.set_queue_config(queue_config)
     source_streams = []
     for i in range(fan_in):
-        print(i)
         stream = env.source(Source(rounds, record_type,
                                     record_size, sample_period))
-        if partitioning == "shuffling":
+        if partitioning == "shuffle":
             stream = stream.shuffle()
         elif partitioning == "broadcast":
             stream = stream.broadcast()
         source_streams.append(stream)
     stream = source_streams.pop()
     stream = stream.union(source_streams)
-    stream = stream.write_text_file(log_filename, compute_elapsed_time)
+    stream = stream.flat_map(compute_elapsed_time)
+    # Add one sink per flatmap instance to log the per-record latencies
+    _ = stream.write_text_file(latency_filename)
     start = time.time()
     dataflow = env.execute()
     ray.get(dataflow.termination_status())
+    write_throughput_file(throughput_filename, dataflow)
     logger.info("Elapsed time: {}".format(time.time()-start))
 
-def fan_out_dataflow(rounds, fan_out, partitioning, record_type,
-                     record_size, queue_config, log_filename,
-                     sample_period):
+def fan_out_benchmark(rounds, fan_out, partitioning, record_type,
+                     record_size, queue_config, sample_period,
+                     latency_filename, throughput_filename):
     # Create streaming environment, construct and run dataflow
     env = Environment()
     env.set_queue_config(queue_config)
     stream = env.source(Source(rounds, record_type,
                                 record_size, sample_period))
-    if partitioning == "shuffling":
+    if partitioning == "shuffle":
         stream = stream.shuffle()
     elif partitioning == "broadcast":
         stream = stream.broadcast()
-    stream = stream.map(lambda record: record).set_parallelism(fan_out)
-    stream = stream.write_text_file(log_filename,compute_elapsed_time)
+    stream = stream.flat_map(compute_elapsed_time).set_parallelism(fan_out)
+    # Add one sink per flatmap instance to log the per-record latencies
+    _ = stream.write_text_file(latency_filename).set_parallelism(fan_out)
     start = time.time()
     dataflow = env.execute()
     ray.get(dataflow.termination_status())
+    write_throughput_file(throughput_filename, dataflow)
     logger.info("Elapsed time: {}".format(time.time()-start))
 
+# Collects throughputs for all actors in the dataflow (except the sink)
+# Writes logs in the form 'operator_id instance_id throughput'
+def write_throughput_file(throughput_filename, dataflow):
+    # Collect throughputs for all actors (except the sink)
+    ids = dataflow.operator_ids()
+    throughputs = []
+    for id in ids:
+        logs = ray.get(dataflow.logs_of(id))
+        throughputs.extend(logs)
+    with open(throughput_file, "w") as tf:
+        for actor_id, throughput_values in throughputs:
+            operator_id, instance_id = actor_id
+            for value in throughput_values:
+                tf.write(str(operator_id) + " " + str(
+                    instance_id) + " " + str(value) + "\n")
 
 if __name__ == "__main__":
     ray.init()
@@ -162,7 +173,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     rounds = int(args.rounds)
-    log_filename = str(args.log_file)
+    latency_filename = str(args.latency_file)
+    throughput_filename = str(args.throughput_file)
     sample_period = int(args.sample_period)
     fan_in = int(args.fan_in)
     fan_out = int(args.fan_out)
@@ -179,7 +191,8 @@ if __name__ == "__main__":
     logger.info("== Parameters ==")
     logger.info("Rounds: {}".format(rounds))
     logger.info("Sample period: {}".format(sample_period))
-    logger.info("Log file: {}".format(log_filename))
+    logger.info("Latency file: {}".format(latency_filename))
+    logger.info("Throughput file: {}".format(throughput_filename))
     if fan_in != 0:
         logger.info("Fan-in: {}".format(fan_in))
     if fan_out != 0:
@@ -196,7 +209,7 @@ if __name__ == "__main__":
     logger.info("Max read throughput: {}".format(max_reads_per_second))
 
     # Estimate the ideal throughput
-    source = Source(rounds, record_type, record_size)
+    source = Source(rounds, record_type, record_size, sample_period)
     count = 0
     start = time.time()
     while True:
@@ -212,11 +225,11 @@ if __name__ == "__main__":
 
     if fan_in != 0:
         logger.info("== Testing fan-in ==")
-        fan_in_dataflow(rounds, fan_in, partitioning, record_type,
-                        record_size, queue_config, log_filename,
-                        sample_period)
+        fan_in_benchmark(rounds, fan_in, partitioning, record_type,
+                        record_size, queue_config, sample_period,
+                        latency_filename, throughput_filename)
     if fan_out != 0:
         logger.info("== Testing fan-out ==")
-        fan_out_dataflow(rounds, fan_out, partitioning, record_type,
-                         record_size, queue_config, log_filename,
-                         sample_period)
+        fan_out_benchmark(rounds, fan_out, partitioning, record_type,
+                         record_size, queue_config, sample_period,
+                         latency_filename, throughput_filename)

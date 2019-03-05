@@ -11,7 +11,7 @@ import ray
 import ray.experimental.signal as signal
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logger.setLevel("INFO")
 
 #
 # Each Ray actor corresponds to an operator instance in the physical dataflow
@@ -44,14 +44,17 @@ class OperatorInstance(object):
     # for debugging purposes
     def __init__(self,
                  instance_id,
+                 operator_metadata,
                  input_gate,
                  output_gate,
                  config=None):
+        self.metadata = operator_metadata
         self.key_index = None       # Index for key selection
         self.key_attribute = None   # Attribute name for key selection
         self.instance_id = instance_id
         self.input = input_gate
         self.output = output_gate
+        self.this_actor = None  # A handle to self
         # Parameters for periodic rescheduling
         if not config:  # Actor will spin continuously until termination
             self.records_limit = float("inf")   # Unlimited
@@ -76,16 +79,40 @@ class OperatorInstance(object):
         # TODO (john): Add more channel types here
 
     # Used for index-based key extraction, e.g. for tuples
-    def index_based_selector(self,record):
+    def _index_based_selector(self,record):
         return record[self.key_index]
 
     # Used for attribute-based key extraction, e.g. for classes
-    def attribute_based_selector(self,record):
+    def _attribute_based_selector(self,record):
         return vars(record)[self.key_attribute]
 
     # Used to register own handle so that the actor can schedule itself
-    def register_handle(self,actor_handle):
+    def _register_handle(self, actor_handle):
         self.this_actor = actor_handle
+
+    # Used to register the handle of a destination
+    # actor to the given output channel
+    def _register_destination_handle(self, actor_handle, channel_id):
+        for channel in self.output.forward_channels:
+            if channel.id == channel_id:
+                channel.register_destination_actor(actor_handle)
+                return
+        for channels in self.output.shuffle_channels:
+            for channel in channels:
+                if channel.id == channel_id:
+                    channel.register_destination_actor(actor_handle)
+                    return
+        for channels in self.output.shuffle_key_channels:
+            for channel in channels:
+                if channel.id == channel_id:
+                    channel.register_destination_actor(actor_handle)
+                    return
+        for channels in self.output.round_robin_channels:
+            for channel in channels:
+                if channel.id == channel_id:
+                    channel.register_destination_actor(actor_handle)
+                    return
+        # TODO (john): Add more channel types here
 
     # Used to periodically stop spinning and reschedule an actor
     # in order to call other methods on it from the outside world
@@ -112,7 +139,7 @@ class OperatorInstance(object):
 
 # A monitoring actor used to keep track of the execution's progress
 @ray.remote
-class ProgressMonitor(OperatorInstance):
+class ProgressMonitor(object):
     """A monitoring actor used to track the progress of
     the dataflow execution.
 
@@ -151,8 +178,9 @@ class ReadTextFile(OperatorInstance):
                  operator_metadata,
                  input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
-        self.filepath = operator_metadata.other_args
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
+        self.filepath = operator_metadata.filepath
         # TODO (john): Handle possible exception here
         self.reader = open(self.filepath, "r")
 
@@ -170,7 +198,6 @@ class ReadTextFile(OperatorInstance):
             self.output._push(
                 record[:-1])  # Push after removing newline characters
 
-
 # Map actor
 @ray.remote
 class Map(OperatorInstance):
@@ -186,25 +213,45 @@ class Map(OperatorInstance):
 
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
         self.map_fn = operator_metadata.logic
+        self.throughputs = []
 
-    # Applies the mapper each record of the input stream(s)
+    # Applies the map to each record of the input stream(s)
     # and pushes resulting records to the output stream(s)
     def start(self):
+        records = 0
+        N = 100000
         start = time.time()
-        elements = 0
         while True:
+            # TODO (john): Make this optional with a logging flag
+            if records == N:  # Log throughput every N records
+                self.throughputs.append(records / (time.time()-start))
+                records = 0
+                start = time.time()
             record = self.input._pull()
             if record is None:
                 self.output._flush(close=True)
-                logger.debug("[map {}] read/writes per second: {}".format(
-                                        self.instance_id,
-                                        elements / (time.time()-start)))
                 signal.send(ActorExit())
                 return
             self.output._push(self.map_fn(record))
-            elements += 1
+            records += 1
+
+    # Returns the logged throughput values
+    def logs(self):
+        return (self.instance_id, self.throughputs)
+
+    # Task-based map execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                self.output._push(self.map_fn(record))
 
 # Flatmap actor
 @ray.remote
@@ -221,20 +268,45 @@ class FlatMap(OperatorInstance):
 
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
         self.flatmap_fn = operator_metadata.logic
+        self.throughputs = []
 
     # Applies the splitter to the records of the input stream(s)
     # and pushes resulting records to the output stream(s)
     def start(self):
+        records = 0
+        N = 100000
+        start = time.time()
         while True:
+            # TODO (john): Make this optional with a logging flag
+            if records == N:  # Log throughput every N records
+                self.throughputs.append(records / (time.time()-start))
+                records = 0
+                start = time.time()
             record = self.input._pull()
             if record is None:
                 self.output._flush(close=True)
                 signal.send(ActorExit())
                 return
             self.output._push_all(self.flatmap_fn(record))
+            records += 1
 
+    # Returns the logged throughput values
+    def logs(self):
+        return (self.instance_id, self.throughputs)
+
+    # Task-based flatmap execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                self.output._push_all(self.flatmap_fn(record))
 
 # Filter actor
 @ray.remote
@@ -251,7 +323,8 @@ class Filter(OperatorInstance):
 
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
         self.filter_fn = operator_metadata.logic
 
     # Applies the filter to the records of the input stream(s)
@@ -266,7 +339,17 @@ class Filter(OperatorInstance):
             if self.filter_fn(record):
                 self.output._push(record)
 
-
+    # Task-based filter execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                if self.filter_fn(record):
+                    self.output._push(record)
 # Union actor
 @ray.remote
 class Union(OperatorInstance):
@@ -274,7 +357,8 @@ class Union(OperatorInstance):
 
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
 
     # Simply moves records from input to output repeatedly
     def start(self):
@@ -286,6 +370,16 @@ class Union(OperatorInstance):
                 return
             self.output._push(record)
 
+    # Task-based union execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                self.output._push(record)
 
 # Inspect actor
 @ray.remote
@@ -300,13 +394,15 @@ class Inspect(OperatorInstance):
 
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                   operator_metadata, input_gate, output_gate)
         self.inspect_fn = operator_metadata.logic
 
-        # Applies the inspect logic (e.g. print) to the records of
-        # the input stream(s)
-        # and leaves stream unaffected by simply pushing the records to
-        # the output stream(s)
+    # Applies the inspect logic (e.g. print) to the records of
+    # the input stream(s)
+    # and leaves stream unaffected by simply pushing the records to
+    # the output stream(s)
+    def start(self):
         while True:
             record = self.input._pull()
             if record is None:
@@ -315,6 +411,18 @@ class Inspect(OperatorInstance):
                 return
             self.inspect_fn(record)
             self.output._push(record)
+
+    # Task-based inspect execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                self.inspect_fn(record)
+                self.output._push(record)
 
 # Reduce actor
 @ray.remote
@@ -331,20 +439,21 @@ class Reduce(OperatorInstance):
 
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate, config=None):
-        OperatorInstance.__init__(self, instance_id, input_gate,
-                                 output_gate, config)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate,
+                                  output_gate, config)
         self.state = {}                             # key -> value
         self.reduce_fn = operator_metadata.logic    # Reduce function
         # Set the attribute selector
-        self.attribute_selector = operator_metadata.other_args
+        self.attribute_selector = operator_metadata.attribute_selector
         if self.attribute_selector is None:
             self.attribute_selector = _identity
         elif isinstance(self.attribute_selector, int):
             self.key_index = self.attribute_selector
-            self.attribute_selector = self.index_based_selector
+            self.attribute_selector = self._index_based_selector
         elif isinstance(self.attribute_selector, str):
             self.key_attribute = self.attribute_selector
-            self.attribute_selector = self.attribute_based_selector
+            self.attribute_selector = self._attribute_based_selector
         elif not isinstance(self.attribute_selector, types.FunctionType):
             sys.exit("Unrecognized or unsupported key selector.")
 
@@ -379,6 +488,27 @@ class Reduce(OperatorInstance):
     def state(self):
         return self.state
 
+    # Task-based reduce execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                key, rest = record
+                new_value = self.attribute_selector(rest)
+                # TODO (john): Is there a way to update state with
+                # a single dictionary lookup?
+                try:
+                    old_value = self.state[key]
+                    new_value = self.reduce_fn(old_value, new_value)
+                    self.state[key] = new_value
+                except KeyError:  # Key does not exist in state
+                    self.state.setdefault(key, new_value)
+                self.output._push((key, new_value))
+
 @ray.remote
 class KeyBy(OperatorInstance):
     """A key_by operator instance that physically partitions the
@@ -391,15 +521,16 @@ class KeyBy(OperatorInstance):
 
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
         # Set the key selector
-        self.key_selector = operator_metadata.other_args
+        self.key_selector = operator_metadata.key_selector
         if isinstance(self.key_selector, int):
             self.key_index = self.key_selector
-            self.key_selector = self.index_based_selector
+            self.key_selector = self._index_based_selector
         elif isinstance(self.key_selector, str):
             self.key_attribute = self.key_selector
-            self.key_selector = self.attribute_based_selector
+            self.key_selector = self._attribute_based_selector
         elif not isinstance(self.key_selector, types.FunctionType):
             sys.exit("Unrecognized or unsupported key selector.")
 
@@ -414,55 +545,78 @@ class KeyBy(OperatorInstance):
             key = self.key_selector(record)
             self.output._push((key,record))
 
+    # Task-based keyby execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                key = self.key_selector(record)
+                self.output._push((key,record))
 
 # A custom source actor
 @ray.remote
 class Source(OperatorInstance):
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
         # The user-defined source with a get_next() method
-        self.source = operator_metadata.other_args
+        self.source = operator_metadata.source
+        self.throughputs = []
 
     # Starts the source by calling get_next() repeatedly
     def start(self):
-        start = time.time()
         records = 0
+        N = 100000
+        start = time.time()
         while True:
+            # TODO (john): Make this optional with a logging flag
+            if records == N:  # Log throughput every N records
+                self.throughputs.append(records / (time.time()-start))
+                records = 0
+                start = time.time()
             record = self.source.get_next()
             if record is None:
                 self.output._flush(close=True)
                 signal.send(ActorExit())
-                logger.debug("[writer {}] puts per second: {}".format(
-                                            self.instance_id,
-                                            records / (time.time()-start)))
                 return
             self.output._push(record)
             records += 1
+
+    # Returns the logged throughput values
+    def logs(self):
+        return (self.instance_id, self.throughputs)
 
 # A sink actor that writes records to a distributed text file
 @ray.remote
 class WriteTextFile(OperatorInstance):
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
         # Common prefix for all instances of the sink as given by the user
-        prefix = operator_metadata.other_args[0]
+        prefix = operator_metadata.filename_prefix
         # Suffix of self's filename
         operator_id, local_instance_id = instance_id
         suffix = str(operator_id) + "_" + str(local_instance_id)
         self.filename = prefix + "_" + suffix
         # TODO (john): Handle possible exception here
         self.writer = open(self.filename, "w")
-        # User-defined logic applied to each record
-        user_logic = operator_metadata.other_args[1]
-        self.logic = user_logic if user_logic else _identity
+        # User-defined logic applied to each record (optional)
+        self.logic = operator_metadata.logic
 
-    # Applies logic (if any) and writes result to file
+    # Applies logic (if any) and writes result to a text file
     def _put_next(self, record):
-        self.writer.write(str(self.logic(record)) + "\n")
+        if self.logic is None:
+            self.writer.write(str(record) + "\n")
+        else:
+            self.writer.write(str(self.logic(record)) + "\n")
 
-    # Starts the sink by calling put_next() repeatedly
+    # Starts the sink
     def start(self):
         while True:
             record = self.input._pull()
@@ -472,14 +626,30 @@ class WriteTextFile(OperatorInstance):
                 return
             self._put_next(record)
 
-# Time window actor (uses system time)
+    # Returns the logged throughput values
+    def logs(self):
+        return (self.instance_id, [])
+
+    # Task-based sink execution
+    def apply(self, batches, channel_id):
+        for batch in batches:
+            for record in batch:
+                if record is None:
+                    if self.input._close_channel(channel_id):
+                        self.output._flush(close=True)
+                        signal.send(ActorExit())
+                    return
+                self._put_next(record)
+
+# TODO (john): Time window actor (uses system time)
 @ray.remote
 class TimeWindow(OperatorInstance):
     def __init__(self, instance_id, operator_metadata, input_gate,
                  output_gate):
-        OperatorInstance.__init__(self, instance_id, input_gate, output_gate)
+        OperatorInstance.__init__(self, instance_id,
+                                  operator_metadata, input_gate, output_gate)
         # The length of the window in ms
-        self.length = operator_metadata.other_args
+        self.length = operator_metadata.length
         self.window_state = []
         self.start = time.time()
 
@@ -500,3 +670,7 @@ class TimeWindow(OperatorInstance):
                 self.output._push_all(self.window_state)
                 self.window_state.clear()
                 self.start = time.time()
+
+    # Task-based time window execution
+    def apply(self, batches, channel_id):
+        sys.exit("Task-based time window execution not supported yet.")
