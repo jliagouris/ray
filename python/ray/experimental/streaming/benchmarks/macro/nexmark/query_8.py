@@ -75,7 +75,7 @@ parser.add_argument("--sample-period", default=100,
 parser.add_argument("--auction-sources", default=1,
                     # TODO (john): Add check
                     help="number of auction sources")
-parser.add_argument("--auctions-rate", default=-1,
+parser.add_argument("--source-rate", default=-1,
                     type=lambda x: float(x) or
                                 parser.error("Source rate cannot be zero."),
                     help="source output rate (records/s)")
@@ -206,7 +206,7 @@ if __name__ == "__main__":
     prefetch_depth = int(args.prefetch_depth)
     background_flush = bool(args.background_flush)
     auction_sources = int(args.auction_sources)
-    auctions_rate = float(args.auctions_rate)
+    auctions_rate = float(args.source_rate)
     person_sources = int(args.person_sources)
     persons_rate = float(args.persons_rate)
     pin_processes = bool(args.pin_processes)
@@ -337,14 +337,14 @@ if __name__ == "__main__":
     persons = persons_source.partition(lambda person: person['id'])
 
     # 60' tumbling window
-    auctions_window = auctions.event_time_window(10000, 5000,
+    auctions_window = auctions.event_time_window(20000, 10000,
                         name="Auctions per Window",
                         placement=placement[
                                 "Auctions per Window"]).set_parallelism(
                                                             window_instances)
 
     # 60' tumbling window
-    persons_window = persons.event_time_window(10000, 5000,
+    persons_window = persons.event_time_window(20000, 10000,
                         name="Persons per Window",
                         placement=placement[
                                 "Persons per Window"]).set_parallelism(

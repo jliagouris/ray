@@ -27,7 +27,7 @@ python query_$QUERY.py \
     --auctions-file /home/ubuntu/ray/python/ray/experimental/streaming/benchmarks/macro/nexmark/auctions \
     --persons-file /home/ubuntu/ray/python/ray/experimental/streaming/benchmarks/macro/nexmark/persons \
     --records $NUM_EVENTS --dump-file dump-$QUERY --simulate-cluster \
-    --latency-file $FILENAME
+    --latency-file $FILENAME --source-rate $THROUGHPUT
 
 echo "target throughput: $THROUGHPUT" | tee -a $FILENAME
 echo "Query $QUERY `grep "SOURCE THROUGHPUT" /tmp/ray/*/logs/worker*`" | tee -a $FILENAME

@@ -73,7 +73,7 @@ parser.add_argument("--sample-period", default=100,
 parser.add_argument("--auction-sources", default=1,
                     # TODO (john): Add check
                     help="number of auction sources")
-parser.add_argument("--auctions-rate", default=-1,
+parser.add_argument("--source-rate", default=-1,
                     type=lambda x: float(x) or
                                 parser.error("Source rate cannot be zero."),
                     help="source output rate (records/s)")
@@ -187,7 +187,7 @@ if __name__ == "__main__":
     prefetch_depth = int(args.prefetch_depth)
     background_flush = bool(args.background_flush)
     auction_sources = int(args.auction_sources)
-    auctions_rate = float(args.auctions_rate)
+    auctions_rate = float(args.source_rate)
     person_sources = int(args.person_sources)
     persons_rate = float(args.persons_rate)
     pin_processes = bool(args.pin_processes)
