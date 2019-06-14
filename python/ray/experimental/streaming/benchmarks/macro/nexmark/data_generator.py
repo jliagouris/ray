@@ -33,7 +33,6 @@ class NexmarkEventGenerator(object):
         self.count = 0
         self.period = sample_period
         self.start = 0
-
         self.done = False
 
     # Parses a nexmark event log and creates an event object
@@ -49,6 +48,7 @@ class NexmarkEventGenerator(object):
             value = int(k_v[1]) if k_v[1][0] != "\"" else str(k_v[1])
             if (key != "extra") or (not omit_extra_field):
                 setattr(obj, key, value)
+        # Return the event's fields in the form of a dictionary
         return obj.__dict__
 
     # Used to rate limit the source
@@ -59,66 +59,64 @@ class NexmarkEventGenerator(object):
 
     # Loads input file
     def init(self):
-        # Read all events from the input file
+        # Load all events from the input file in memory
         logger.info("Loading input file...")
         records = 0
         with open(self.event_file, "r") as ef:
             for event in ef:
                 self.events.append(self.__create_event(event,
-                                                  self.omit_extra_field))
+                                    self.omit_extra_field))
                 records += 1
                 if records == self.max_records:
                     break
-        while len(self.events) < self.max_records:
-            last_event_time = self.events[-1]['dateTime']
-            events = []
-            for event in self.events:
-                event = dict(event)
-                event['dateTime'] += last_event_time
-                events.append(event)
-            self.events += events
         logger.info("Done.")
 
-    # Returns the next event
+    # Returns the next batch of events for the given size
     def get_next_batch(self, batch_size):
         if not self.start:
+            # Start time is used in __wait() to measure source throughput
             self.start = time.time()
         if self.total_count == len(self.events):
-            self.done = True
-        if self.done or (self.total_count >= self.max_records):
+            return None  # Exhausted
+        # If we reached the max number of events
+        if self.total_count >= self.max_records:
             return None  # Exhausted
         limit = min(len(self.events), self.total_count + batch_size)
         event_batch = self.events[self.total_count:limit]
         added_records = limit - self.total_count
         self.total_count += added_records
-        self.__wait()  # Wait if needed
+        self.__wait()  # Wait if needed to meet the desired throughput
         self.count += added_records
         if self.count >= self.period:
             self.count = 0
-            # Assign the generation timestamp
-            # to the 1st record of the batch
+            # Assign the generation timestamp to the 1st record of the batch
+            # TODO (john): Should we assign this timestamp randomly?
             event_batch[0]["system_time"] = time.time()
         return event_batch
 
     # Returns the next event
     def get_next(self):
         if not self.start:
+            # Start time is used in __wait() to measure source throughput
             self.start = time.time()
-        if (not self.events) or (self.total_count == self.max_records):
+        if self.total_count == len(self.events):
             return None  # Exhausted
-        event = self.events.pop(0)
+        # If we reached the max number of events
+        if self.total_count == self.max_records:
+            return None  # Exhausted
+        event = self.events[self.total_count]
         self.total_count += 1
-        self.__wait()  # Wait if needed
+        self.__wait()  # Wait if needed to meet the desired throughput
         self.count += 1
         if self.count == self.period:
             self.count = 0
-            # Assign the generation timestamp
-            event.system_time = time.time()
+            # Assign the generation timestamp to the record
+            event["system_time"] = time.time()
         return event
 
-    # Drains the source as fast as possible
+    # Drains the data generator as fast as possible
     def drain(self):
-        self.event_rate = float("inf")  # Set rate limit to inf
+        self.event_rate = float("inf")  # Set source rate to unbounded
         records = 0
         while self.get_next() is not None:
             records += 1
