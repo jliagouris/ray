@@ -99,10 +99,8 @@ class NexmarkEventGenerator(object):
         if not self.start:
             # Start time is used in __wait() to measure source throughput
             self.start = time.time()
-        if self.total_count == len(self.events):
-            return None  # Exhausted
-        # If we reached the max number of events
-        if self.total_count == self.max_records:
+        if (self.total_count == len(self.events) or 
+            self.total_count == self.max_records):
             return None  # Exhausted
         event = self.events[self.total_count]
         self.total_count += 1
@@ -114,7 +112,8 @@ class NexmarkEventGenerator(object):
             event["system_time"] = time.time()
         return event
 
-    # Drains the data generator as fast as possible
+    # Drains the data generator as fast as possible and 
+    # returns the total number of records
     def drain(self):
         self.event_rate = float("inf")  # Set source rate to unbounded
         records = 0

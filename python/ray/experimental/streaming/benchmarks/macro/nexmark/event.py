@@ -33,7 +33,7 @@ class Auction(Event):
                        initial_bid=None, reserve=None,
                        date_time=None, expires=None, seller=None,
                        category=None, extra=None):
-        Event.__init__(self, date_time, extra, event_type="Auction")
+        Event.__init__(self, date_time, extra=extra, event_type="Auction")
         self.id = id
         self.itemName = item_name
         self.description = description
@@ -56,7 +56,7 @@ class Auction(Event):
 class Bid(Event):
     def __init__(self, auction=None, bidder=None,
                        price=None, date_time=None, extra=None):
-        Event.__init__(self, date_time, extra, event_type="Bid")
+        Event.__init__(self, date_time, extra=extra, event_type="Bid")
         self.auction = auction
         self.bidder = bidder
         self.price = price
@@ -71,7 +71,7 @@ class Bid(Event):
 class Person(Event):
     def __init__(self, id=None, name=None, email=None, credit_card=None,
                        city=None, state=None, date_time=None, extra=None):
-        Event.__init__(self, date_time, extra, event_type="Person")
+        Event.__init__(self, date_time, extra=extra, event_type="Person")
         self.id = id
         self.name = name
         self.emailAddress = email

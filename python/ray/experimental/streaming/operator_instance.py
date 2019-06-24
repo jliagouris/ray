@@ -1119,8 +1119,8 @@ class Source(OperatorInstance):
         if (max_timestamp >=
                 self.max_event_time + self.watermark_interval):
             # Emit watermark
-            # logger.info("Source emitting watermark {} due to {}".format(
-            #             self.max_event_time, max_timestamp))
+            logger.debug("Source emitting watermark {} due to {} on interval {}".format(
+                        self.max_event_time, max_timestamp, self.watermark_interval))
             self.output._push(Watermark(self.max_event_time, time.time()).__dict__)
             self.max_event_time = max_timestamp
 
@@ -1135,7 +1135,6 @@ class Source(OperatorInstance):
             logger.debug("XXX Source emitting watermark {} due to {} on interval {}".format(
                         self.max_event_time, max_timestamp, self.watermark_interval))
             self.output._push(Watermark(self.max_event_time, time.time()).__dict__)
-            self.output._flush()
             self.max_event_time = max_timestamp
 
 
