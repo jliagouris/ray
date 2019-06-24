@@ -1011,12 +1011,8 @@ class Worker(object):
                 # Reset the state fields so the next task can run.
                 self.task_context.current_task_id = TaskID.nil()
                 self.task_context.task_index = 0
-                try:  # Python >= 3.3 
-                    self.task_context.arguments.clear()
-                    self.task_context.returns.clear()
-                except:
-                    del self.task_context.arguments[:]
-                    del self.task_context.returns[:]
+                del self.task_context.arguments[:]
+                del self.task_context.returns[:]
                 if self.actor_id.is_nil():
                     # Don't need to reset task_driver_id if the worker is an
                     # actor. Because the following tasks should all have the
