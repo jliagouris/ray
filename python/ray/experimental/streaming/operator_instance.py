@@ -1143,38 +1143,22 @@ class Source(OperatorInstance):
         signal.send(ActorStart(self.instance_id))
         self.start_time = time.time()
         while True:
-            if self.batch_size is None:
-                record = self.source.get_next()
-                # logger.debug("SOURCE %s", record)
-                if record is None:
-                    self.output._flush(close=True)
-                    signal.send(ActorExit(self.instance_id))
-                    return
-                self.output._push(record)
-                if self.watermark_interval > 0:
-                    # Check if watermark should be emitted
-                    self.__watermark(record)
-
-                self.num_records_seen += 1
-                # if self.num_records_seen % CHECKPOINT_INTERVAL == 0:
-                #     self.set_checkpoint_epoch(self.checkpoint_epoch + 1)
-            else:
-                record_batch = self.source.get_next_batch(self.batch_size)
-                if record_batch is None:
-                    logger.info("SOURCE THROUGHPUT:%f", self.num_records_seen / (time.time() - self.start_time))
-                    self.output._flush(close=True)
-                    signal.send(ActorExit(self.instance_id))
-                    return
-                self.output._push_batch(record_batch)
-                logger.debug("SOURCE %s watermark:%d max_time:%f, record_time:%f", len(record_batch), self.watermark_interval, self.max_event_time, record_batch[-1]["dateTime"])
-                if self.watermark_interval > 0:
+            record_batch = self.source.get_next_batch(self.batch_size)
+            if record_batch is None:
+                logger.info("SOURCE THROUGHPUT:%f", self.num_records_seen / (time.time() - self.start_time))
+                  self.output._flush(close=True)
+                   signal.send(ActorExit(self.instance_id))
+                  return
+            self.output._push_batch(record_batch)
+            logger.debug("SOURCE %s watermark:%d max_time:%f, record_time:%f", len(record_batch), self.watermark_interval, self.max_event_time, record_batch[-1]["dateTime"])
+            if self.watermark_interval > 0:
                     self.__watermark_batch(record_batch)
 
-                self.num_records_seen += len(record_batch)
-                if self.num_records_seen % 10000 == 0:
-                    logger.info("source throughput:%f", self.num_records_seen / (time.time() - self.start_time))
-                # if self.num_records_seen % CHECKPOINT_INTERVAL == 0:
-                #     self.set_checkpoint_epoch(self.checkpoint_epoch + 1)
+            self.num_records_seen += len(record_batch)
+            if self.num_records_seen % 10000 == 0:
+                logger.info("source throughput:%f", self.num_records_seen / (time.time() - self.start_time))
+            # if self.num_records_seen % CHECKPOINT_INTERVAL == 0:
+            #     self.set_checkpoint_epoch(self.checkpoint_epoch + 1)
 
 
 # A custom sink actor
