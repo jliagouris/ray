@@ -592,19 +592,7 @@ class Map(OperatorInstance):
                                   checkpoint_dir)
         self.map_fn = operator_metadata.logic
 
-    # Applies the map to each record of the input stream(s)
-    # and pushes resulting records to the output stream(s)
-    def start(self):
-        signal.send(ActorStart(self.instance_id))
-        while True:
-            record = self.input._pull()
-            if record is None:
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            self.output._push(self.map_fn(record))
-
-    # Task-based map execution on a set of batches
+    # Task-based map execution on a set of records
     def _apply(self, record):
         self.output._push(self.map_fn(record), event=self.num_records_seen)
 
@@ -632,21 +620,8 @@ class FlatMap(OperatorInstance):
                                   checkpoint_dir)
         self.flatmap_fn = operator_metadata.logic
 
-    # Applies the flatmap logic to the records of the input stream(s)
-    # and pushes resulting records to the output stream(s)
-    def start(self):
-        signal.send(ActorStart(self.instance_id))
-        while True:
-            record = self.input._pull()
-            if record is None:
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            self.output._push_all(self.flatmap_fn(record))
-
-    # Task-based flatmap execution on a set of batches
+    # Task-based flatmap execution on a set of records
     def _apply(self, record):
-        # logger.debug("FLATMAP %s", record)
         self.output._push_all(self.flatmap_fn(record), event=self.num_records_seen)
 
     def _replay_apply(self, record, flush=False):
@@ -672,18 +647,6 @@ class Filter(OperatorInstance):
                                   checkpoint_dir)
         self.filter_fn = operator_metadata.logic
 
-    # Applies the filter to the records of the input stream(s)
-    # and pushes resulting records to the output stream(s)
-    def start(self):
-        while True:
-            record = self.input._pull()
-            if record is None:  # Close channel and return
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            if self.filter_fn(record):
-                self.output._push(record)
-
     # Task-based filter execution on a set of batches
     def _apply(self, record):
         if self.filter_fn(record):
@@ -697,16 +660,6 @@ class Filter(OperatorInstance):
 @ray.remote(max_reconstructions=100)
 class Union(OperatorInstance):
     """A union operator instance that concatenates two or more streams."""
-
-    # Repeatedly moves records from input to output
-    def start(self):
-        while True:
-            record = self.input._pull()
-            if record is None:  # Close channel and return
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            self.output._push(record)
 
     # Task-based union execution on a set of batches
     def _apply(self, record):
@@ -731,10 +684,6 @@ class Join(OperatorInstance):
         self.left = operator_metadata.left_input_operator_id
         self.right = operator_metadata.right_input_operator_id
         self.process_logic = None
-
-    # Repeatedly pulls and joins records from both inputs
-    def start(self):
-        sys.exit("Queue-based join is not supported yet.")
 
     # Task-based join execution on a set of batches
     def apply(self, batches, channel_id, source_operator_id, checkpoint_epoch):
@@ -901,11 +850,6 @@ class EventTimeWindow(OperatorInstance):
                     self.state[w] = []
                 self.state[w].append(record)
 
-
-    # Repeatedly pulls and joins records from both inputs
-    def start(self):
-        sys.exit("Queue-based event time window is not supported yet.")
-
     # Task-based window execution on a set of batches
     def _apply(self, record):
         if record['event_type'] == 'Watermark':  # It is a watermark
@@ -934,19 +878,6 @@ class Inspect(OperatorInstance):
                                    operator_metadata, input_gate, output_gate,
                                    checkpoint_dir)
         self.inspect_fn = operator_metadata.logic
-
-    # Applies the inspect logic (e.g. print) to the records of
-    # the input stream(s) and leaves stream unaffected by simply
-    # pushing the records to the output stream(s)
-    def start(self):
-        while True:
-            record = self.input._pull()
-            if record is None:
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            self.inspect_fn(record)
-            self.output._push(record)
 
     # Task-based inspect execution on a set of batches
     def _apply(self, record):
@@ -989,33 +920,6 @@ class Reduce(OperatorInstance):
             self.attribute_selector = self._attribute_based_selector
         elif not isinstance(self.attribute_selector, types.FunctionType):
             sys.exit("Unrecognized or unsupported key selector.")
-
-    # Combines the input value for a key with the last reduced
-    # value for that key to produce a new value.
-    # Outputs the result as a tuple of the form (key,new value)
-    def start(self):
-        while True:
-            if self._reschedule():
-                # Stop spinning so that other methods can be
-                # called on this actor from the outside world
-                return
-            record = self.input._pull()
-            if record is None:
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            key, rest = record
-            new_value = self.attribute_selector(rest)
-            # TODO (john): Is there a way to update state with
-            # a single dictionary lookup?
-            try:
-                old_value = self.state[key]
-                new_value = self.reduce_fn(old_value, new_value)
-                self.state[key] = new_value
-            except KeyError:  # Key does not exist in state
-                self.state.setdefault(key, new_value)
-            self.output._push((key, new_value))
-            self.records_processed += 1
 
     # Returns the local state of the actor
     def state(self):
@@ -1075,17 +979,6 @@ class KeyBy(OperatorInstance):
         elif not isinstance(self.key_selector, types.FunctionType):
             sys.exit("Unrecognized or unsupported key selector.")
 
-    # The actual stream partitioning is done by the output gate
-    def start(self):
-        while True:
-            record = self.input._pull()
-            if record is None:
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            key = self.key_selector(record)
-            self.output._push((key,record))
-
     # Task-based keyby execution on a set of batches
     def _apply(self, record):
         key = self.key_selector(record)
@@ -1103,40 +996,47 @@ class Source(OperatorInstance):
         OperatorInstance.__init__(self, instance_id,
                                   operator_metadata, input_gate, output_gate,
                                   checkpoint_dir)
-        # The user-defined source with a get_next() method
+        # The user-defined source with a get_next_batch() method
         _, local_instance_id = instance_id
         source_objects = operator_metadata.sources
+        # Distinguish between single- and multi-instance sources
         self.source = source_objects[local_instance_id] if isinstance(
                             source_objects, list) else source_objects
-        self.source.init()
+        self.source.init()  # Initialize the source
         self.watermark_interval = operator_metadata.watermark_interval
-        self.max_event_time = 0
+        self.max_event_time = 0  # Max event timestamp seen so far
         self.batch_size = operator_metadata.batch_size
 
-    def __watermark(self, record):
-        event_time = record["dateTime"]  # TODO (john): Make this general
-        max_timestamp = max(event_time, self.max_event_time)
-        if (max_timestamp >=
-                self.max_event_time + self.watermark_interval):
-            # Emit watermark
-            logger.debug("Source emitting watermark {} due to {} on interval {}".format(
-                        self.max_event_time, max_timestamp, self.watermark_interval))
-            self.output._push(Watermark(self.max_event_time, time.time()).__dict__)
-            self.max_event_time = max_timestamp
+    def __watermark(self, record_batch):
+        """Generates one or more watermarks.
 
-    def __watermark_batch(self, record_batch):
+        This method checks if a watermark must be emitted by the source based
+        on the event times seen so far and a user-defined watermark interval.
+
+        Attributes:
+             record_batch (list): The list of input records,
+             each one with an associated event time.
+        """
         max_timestamp = 0
         for record in record_batch:
-            event_time = record["dateTime"]  # TODO (john): Make this general
+            try:
+                event_time = record["dateTime"]
+            except AttributeError:
+                raise Exception("No event time found.")
             max_timestamp = max(event_time, self.max_event_time)
         if (max_timestamp >=
                 self.max_event_time + self.watermark_interval):
             # Emit watermark
-            logger.debug("XXX Source emitting watermark {} due to {} on interval {}".format(
-                        self.max_event_time, max_timestamp, self.watermark_interval))
-            self.output._push(Watermark(self.max_event_time, time.time()).__dict__)
+            log_message = "Source emitting watermark {} due to {}"
+            log_message += "on interval {}"
+            logger.debug(log_message.format(self.max_event_time,
+                                            max_timestamp,
+                                            self.watermark_interval))
+            # Use obj.__dict__ instead of the object itself
+            self.output._push(Watermark(self.max_event_time,
+                                        time.time()).__dict__)
+            # Update max event time seen so far
             self.max_event_time = max_timestamp
-
 
     # Starts the source by calling get_next() repeatedly
     def start(self):
@@ -1144,22 +1044,24 @@ class Source(OperatorInstance):
         self.start_time = time.time()
         while True:
             record_batch = self.source.get_next_batch(self.batch_size)
-            if record_batch is None:
-                logger.info("SOURCE THROUGHPUT:%f", self.num_records_seen / (time.time() - self.start_time))
-                  self.output._flush(close=True)
-                   signal.send(ActorExit(self.instance_id))
-                  return
+            if record_batch is None:  # Source is exhausted
+                logger.info("Source throuhgput: {}".format(
+                            self.num_records_seen / (
+                            time.time() - self.start_time)))
+                self.output._flush(close=True)  # Flush and close output
+                signal.send(ActorExit(self.instance_id))  # Send exit signal
+                return
             self.output._push_batch(record_batch)
-            logger.debug("SOURCE %s watermark:%d max_time:%f, record_time:%f", len(record_batch), self.watermark_interval, self.max_event_time, record_batch[-1]["dateTime"])
-            if self.watermark_interval > 0:
-                    self.__watermark_batch(record_batch)
-
+            # TODO (john): Handle the case a record does not have event time
+            logger.debug("Source watermark: {}. Last record time: {}".format(
+                    self.max_event_time, record_batch[-1]["dateTime"]))
+            if self.watermark_interval > 0:  # Watermarks are activated
+                self.__watermark(record_batch)
+            # Measure source throughput every 10K records
             self.num_records_seen += len(record_batch)
             if self.num_records_seen % 10000 == 0:
-                logger.info("source throughput:%f", self.num_records_seen / (time.time() - self.start_time))
-            # if self.num_records_seen % CHECKPOINT_INTERVAL == 0:
-            #     self.set_checkpoint_epoch(self.checkpoint_epoch + 1)
-
+                logger.info("Source throughput: {}".format(
+                    self.num_records_seen / (time.time() - self.start_time)))
 
 # A custom sink actor
 @ray.remote
@@ -1173,17 +1075,6 @@ class Sink(OperatorInstance):
         self.state = operator_metadata.sink
         # TODO (john): Fixme
         # self.checkpoint_tracker = named_actors.get_actor("checkpoint_tracker")
-
-    # Starts the sink by calling process() repeatedly
-    def start(self):
-        signal.send(ActorStart(self.instance_id))
-        while True:
-            record = self.input._pull()
-            if record is None:
-                self.state.close()
-                signal.send(ActorExit(self.instance_id))
-                return
-            self.state.evict(record)
 
     # Task-based sink execution on a set of batches
     def _apply(self, record):
@@ -1227,16 +1118,6 @@ class WriteTextFile(OperatorInstance):
         else:
             self.writer.write(str(self.logic(record)) + "\n")
 
-    # Starts the sink
-    def start(self):
-        while True:
-            record = self.input._pull()
-            if record is None:
-                self.writer.close()
-                signal.send(ActorExit(self.instance_id))
-                return
-            self._put_next(record)
-
     # Task-based sink execution on a set of batches
     def _apply(self, record):
         self._put_next(record, event=self.num_records_seen)
@@ -1257,27 +1138,9 @@ class TimeWindow(OperatorInstance):
         self.state = []
         self.start = time.time()
 
-    def start(self):
-        while True:
-            if self._reschedule():
-                # Stop spinning so that other methods can be
-                # called on this actor from the outside world
-                return
-            record = self.source.get_next()
-            if record is None:
-                self.output._flush(close=True)
-                signal.send(ActorExit(self.instance_id))
-                return
-            self.state.append(record)
-            elapsed_time = time.time() - self.start
-            if elapsed_time >= self.length:
-                self.output._push_all(self.state)
-                self.state.clear()
-                self.start = time.time()
-
     # Task-based time window execution
     def apply(self, batches, channel_id, _source_operator_id):
-        sys.exit("Task-based time window execution not supported yet.")
+        raise NotImplementedError
 
 @ray.remote
 class CheckpointTracker(object):

@@ -10,11 +10,11 @@ class Record(object):
         self.__dict__.update(kwds)
         self.event_type = 'Record'
 
-# An abstract record
+# A watermark with a logical and a generation timestamp
 class Watermark(object):
     def __init__(self, event_time, system_time):
-        self.event_time = event_time
-        self.system_time = system_time
+        self.event_time = event_time    # The watermak's logical time
+        self.system_time = system_time  # The watermark's generation timestamp
         self.event_type = "Watermark"
 
 # An event with an event and a system time. The latter denotes when the

@@ -56,9 +56,6 @@ parser.add_argument("--persons-file", required=False,
 parser.add_argument("--enable-logging", default=False,
                     action='store_true',
                     help="whether to log actor latency and throughput")
-parser.add_argument("--queue-based", default=False,
-                    action='store_true',
-                    help="queue-based execution")
 parser.add_argument("--map-instances", default=1,
                     help="the number of instances of the map operator")
 parser.add_argument("--latency-file", default="latencies",
@@ -119,7 +116,6 @@ if __name__ == "__main__":
     throughput_filename = str(args.throughput_file)
     dump_filename = str(args.dump_file)
     sample_period = int(args.sample_period)
-    task_based = not bool(args.queue_based)
     logging = bool(args.enable_logging)
     map_instances = int(args.map_instances)
     max_queue_size = int(args.queue_size)
@@ -143,7 +139,6 @@ if __name__ == "__main__":
     logger.info("Plasma memory: {}".format(plasma_memory))
     logger.info("Logging: {}".format(logging))
     logger.info("Sample period: {}".format(sample_period))
-    logger.info("Task-based execution: {}".format(task_based))
     logger.info("Bids file: {}".format(bids_file))
     logger.info("Latency file prefix: {}".format(latency_filename))
     logger.info("Throughput file prefix: {}".format(throughput_filename))
@@ -204,8 +199,6 @@ if __name__ == "__main__":
     env.set_queue_config(queue_config)
     if logging:
         env.enable_logging()
-    if task_based:
-        env.enable_tasks()
 
     # Construct the custom source objects (all read from the same file)
     source_objects = [dg.NexmarkEventGenerator(bids_file, "Bid",
@@ -242,13 +235,12 @@ if __name__ == "__main__":
     prefetch_depth = queue_config.prefetch_depth
     background_flush = queue_config.background_flush
     input_rate = source_rate if source_rate > 0 else "inf"
-    all = "-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}".format(
+    all = "-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}".format(
         num_nodes, input_rate, num_sources,
         num_redis_shards, redis_max_memory, plasma_memory,
         sample_period, logging,
         max_queue_size, max_batch_size, batch_timeout, prefetch_depth,
-        background_flush, pin_processes,
-        task_based, map_instances
+        background_flush, pin_processes, map_instances
     )
     utils.write_log_files(all, latency_filename,
                           throughput_filename, dump_filename, dataflow)

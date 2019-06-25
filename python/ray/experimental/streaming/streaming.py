@@ -65,8 +65,7 @@ class Config(object):
     """
 
     def __init__(self, parallelism=1, scheduling_period_in_records=float(
-                 "inf"), scheduling_timeout=1, task_based=False,
-                 logging=False):
+                 "inf"), scheduling_timeout=1, logging=False):
         # Batched queue configuration
         self.queue_config = QueueConfig()
         # Dataflow parallelism
@@ -74,8 +73,6 @@ class Config(object):
         # Parameters for periodic rescheduling of dataflow operators
         self.scheduling_period_in_records = scheduling_period_in_records
         self.scheduling_timeout = scheduling_timeout    # Default: 1s
-        # Task-based evaluation instead of queue-based
-        self.task_based = task_based
         # Logging
         self.logging = logging
         # ...
@@ -443,10 +440,6 @@ class Environment(object):
     def set_parallelism(self, parallelism):
         self.config.parallelism = parallelism
 
-    # Enables task-based execution
-    def enable_tasks(self):
-        self.config.task_based = True
-
     # Enables actor logging
     def enable_logging(self):
         self.config.logging = True
@@ -546,14 +539,6 @@ class Environment(object):
             if operator_type in source_types:
                 source_handles.extend(actor_handles)
                 continue
-            # In queue-based execution all actors are spinning
-            if not self.config.task_based:
-                for actor_handle in actor_handles:
-                    _ = actor_handle.start.remote()  # Start spinning actor
-                    spinning_actor_handles.append(actor_handle)
-        if not self.config.task_based:  # Wait until everybody spins
-            ray.get(monitoring_actor.start_signals.remote(
-                                                    spinning_actor_handles))
         #  Start sources
         for source_handle in source_handles:
             _ = source_handle.start.remote()

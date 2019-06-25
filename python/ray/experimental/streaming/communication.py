@@ -80,8 +80,7 @@ class DataChannel(object):
             max_batch_size=self.queue_config.max_batch_size,
             max_batch_time=self.queue_config.max_batch_time,
             prefetch_depth=self.queue_config.prefetch_depth,
-            background_flush=self.queue_config.background_flush,
-            task_based=env_config.task_based)
+            background_flush=self.queue_config.background_flush)
 
     # Registers source actor handle
     def register_source_actor(self, actor_handle):
@@ -468,7 +467,7 @@ class DataOutput(object):
     # Each individual output queue flushes batches to plasma periodically
     # based on 'batch_max_size' and 'batch_max_time'
     def _push(self, record, input_channel_id=None, event=None):
-        if record['event_type'] == 'Watermark':
+        if record["event_type"] == "Watermark":
             self.__forward_watermark(record, input_channel_id)
             return
         # Simple forwarding
@@ -656,26 +655,46 @@ class DataOutput(object):
 
     # Maintains the last received watermark per input channel
     def __forward_watermark(self, watermark, input_channel_id):
+        """Forwards a watermark to the downstream operators.
+
+        This method checks if a watermark appearing in a channel must be
+        forwarded to all output channels (downstream operator instances).
+        For a source, the watermark is always forwarded to the output.
+        For any other operator, the watermark is not necessarily forwarded;
+        in this case, the forwarded watermark is the minimum watermark
+        received from all input channels of the operator that is strictly
+        larger than the previously forwarded watermark.
+
+        The method assumes single-dimensional watermrks that increase
+        monotonically.
+
+        Attributes:
+             watermark (dict): The actual watermark object's dict
+             input_channel_id (int): The index of the input channel the
+             watermark came from
+        """
         # logger.info("Previous watermark: {}".format(
         #             self.last_emitted_watermark))
-        if input_channel_id is None: # Must be a source
-            self.last_emitted_watermark = watermark['event_time']
+        if input_channel_id is None: # Must be a source, forward watermark
+            self.last_emitted_watermark = watermark["event_time"]
             # logger.info("Source watermark: {}".format(
             #             self.last_emitted_watermark))
             self.__broadcast(watermark)
         else:  # It is an operator with at least one input
-            self.input_channels[input_channel_id] = watermark['event_time']
-            # Find minimum watermark
+            # Set the last seen watermark in this channel
+            self.input_channels[input_channel_id] = watermark["event_time"]
+            # Find minimum watermark amongst all input channels
             minimum_watermark = min(self.input_channels.values())
             if minimum_watermark > self.last_emitted_watermark:  # Forward
                 self.last_emitted_watermark = minimum_watermark
-                watermark['event_time'] = minimum_watermark
+                watermark["event_time"] = minimum_watermark
                 # logger.info("Emitting watermark: {}".format(
                 #             self.last_emitted_watermark))
                 self.__broadcast(watermark)
 
     # Broadcasts a watermark to all output channels
     def __broadcast(self, watermark):
+        """Pushes a watermark to the output but does not necessarily flush."""
         for channel in self.forward_channels:
             channel.queue.push_next(watermark)
         for channels in self.shuffle_channels:

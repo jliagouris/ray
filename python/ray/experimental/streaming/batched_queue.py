@@ -67,7 +67,7 @@ class BatchedQueue(object):
                  max_batch_time=0.01,
                  prefetch_depth=10,
                  background_flush=True,
-                 task_based=False):
+                 task_based=True):
         self.src_operator_id = src_operator_id
         self.src_instance_id = src_instance_id
         self.dst_operator_id = dst_operator_id
