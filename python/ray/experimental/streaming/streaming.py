@@ -109,9 +109,10 @@ class Environment(object):
         # Record the physical dataflow graph (for debugging purposes)
         self.__add_channel(actor_id, input, output)
         # Select actor to construct
+        actor_handle = None
         if operator.type == OpType.Source:
-            source = operator_instance.Source.remote(actor_id, operator, input,
-                                                     output)
+            actor_handle = operator_instance.Source.remote(actor_id, operator,
+                                                           input, output)
             source.register_handle.remote(source)
             return source.start.remote()
         elif operator.type == OpType.Map:
@@ -167,6 +168,23 @@ class Environment(object):
         else:  # TODO (john): Add support for other types of operators
             sys.exit("Unrecognized or unsupported {} operator type.".format(
                 operator.type))
+
+        # Register current actor handle as destination to upstream
+        # actors so that upstream actors can invoke tasks on it
+        for channel in input.input_channels:
+            operator_id, _ = channel.src_actor_id
+            upstream_actor_handles = self.physical_dataflow.actor_handles[
+                operator_id]
+            for handle in upstream_actor_handles:
+                destination_handle = ray.put(actor_handle)
+                # Make sure the handle is registered before proceeding
+                ray.get(
+                    handle._register_destination_handle.remote(
+                        destination_handle, channel.id))
+        # Register own handle (used by actor for scheduling itself)
+        ray.get(actor_handle._register_handle.remote(actor_handle))
+        assert actor_handle is not None
+        return actor_handle
 
     # Constructs and deploys a Ray actor for each instance of
     # the given operator
@@ -229,6 +247,7 @@ class Environment(object):
         The number of total channels generated depends on the partitioning
         strategy specified by the user.
         """
+        env_config = self.config
         channels = {}  # destination operator id -> channels
         strategies = operator.partitioning_strategies
         for dst_operator, p_scheme in strategies.items():
@@ -238,13 +257,13 @@ class Environment(object):
                 for i in range(operator.num_instances):
                     # ID of destination instance to connect
                     id = i % num_dest_instances
-                    channel = DataChannel(self, operator.id, dst_operator, i,
+                    channel = DataChannel(env_config, operator.id, dst_operator, i,
                                           id)
                     entry.append(channel)
             elif p_scheme.strategy in all_to_all_strategies:
                 for i in range(operator.num_instances):
                     for j in range(num_dest_instances):
-                        channel = DataChannel(self, operator.id, dst_operator,
+                        channel = DataChannel(env_config, operator.id, dst_operator,
                                               i, j)
                         entry.append(channel)
             else:
